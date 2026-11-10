@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sebo AWS</title>
+  <style>
+    :root {
+      --bg: #f6f3ee;
+      --surface: #ffffff;
+      --surface-2: #faf8f4;
+      --border: #e4ddd2;
+      --text: #2b2620;
+      --muted: #7a7064;
+      --accent: #8a4b2a;
+      --accent-text: #ffffff;
+      --ok-bg: #e5f3e8;   --ok-fg: #1e6b34;
+      --warn-bg: #fdf1dc; --warn-fg: #8a5a00;
+      --info-bg: #e3eefb; --info-fg: #1f4f8a;
+      --err-bg: #fbe5e3;  --err-fg: #a12a1f;
+      --radius: 10px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1b1916;
+        --surface: #24211d;
+        --surface-2: #2b2723;
+        --border: #3a352f;
+        --text: #ece6dc;
+        --muted: #a39887;
+        --accent: #d08a5e;
+        --accent-text: #1b1916;
+        --ok-bg: #1f3526;   --ok-fg: #8fd6a2;
+        --warn-bg: #3a2f17; --warn-fg: #f0c46b;
+        --info-bg: #1c2b3d; --info-fg: #8fbcf0;
+        --err-bg: #3d1f1c;  --err-fg: #f39a8f;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    .container { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+    header h1 { margin: 0 0 4px; font-size: 1.6rem; }
+    header p { margin: 0 0 16px; color: var(--muted); }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .card h2 { margin: 0 0 12px; font-size: 1.1rem; }
+    .card h2 small { font-weight: normal; color: var(--muted); font-size: .85rem; }
+
+    label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 4px; }
+    input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-2);
+      color: var(--text);
+      font: inherit;
+    }
+    input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+    .grid { display: grid; gap: 12px; }
+    .grid-2 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .row.end { justify-content: flex-end; }
+    .spacer { flex: 1; }
+
+    button {
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: var(--accent-text);
+      border-radius: 8px;
+      padding: 8px 14px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.secondary { background: transparent; color: var(--accent); }
+    button.small { padding: 4px 10px; font-size: .85rem; }
+    button:disabled { opacity: .55; cursor: progress; }
+
+    .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+    .tab {
+      background: transparent;
+      color: var(--muted);
+      border: none;
+      border-bottom: 3px solid transparent;
+      border-radius: 0;
+      padding: 10px 14px;
+    }
+    .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; }
+    td.wrap { white-space: normal; min-width: 160px; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .empty { color: var(--muted); padding: 12px 0; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: .78rem;
+      font-weight: 600;
+    }
+    .badge.ok   { background: var(--ok-bg);   color: var(--ok-fg); }
+    .badge.warn { background: var(--warn-bg); color: var(--warn-fg); }
+    .badge.info { background: var(--info-bg); color: var(--info-fg); }
+
+    .msg { border-radius: 8px; padding: 10px 12px; margin-top: 12px; display: none; }
+    .msg.show { display: block; }
+    .msg.ok   { background: var(--ok-bg);   color: var(--ok-fg); }
+    .msg.warn { background: var(--warn-bg); color: var(--warn-fg); }
+    .msg.err  { background: var(--err-bg);  color: var(--err-fg); }
+    .msg.info { background: var(--info-bg); color: var(--info-fg); }
+
+    .stat { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+    .stat .valor { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .stat .rotulo { color: var(--muted); font-size: .85rem; }
+
+    details summary { cursor: pointer; font-weight: 600; }
+    .hint { color: var(--muted); font-size: .82rem; margin-top: 6px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Sebo AWS</h1>
+    <p>Interface do Comprador e do Colaborador, consumindo as Lambda Function URLs.</p>
+  </header>
+
+  <!-- Configuração das Function URLs -->
+  <section class="card">
+    <details id="config-box">
+      <summary>Configuração das Function URLs</summary>
+      <div class="grid grid-2" style="margin-top:12px">
+        <div>
+          <label for="url-comprador">LAMBDA_COMPRADOR_URL (sebo-comprador-service)</label>
+          <input id="url-comprador" placeholder="https://xxxx.lambda-url.us-east-1.on.aws/" />
+        </div>
+        <div>
+          <label for="url-colaborador">LAMBDA_COLABORADOR_URL (sebo-colaborador-service)</label>
+          <input id="url-colaborador" placeholder="https://yyyy.lambda-url.us-east-1.on.aws/" />
+        </div>
+      </div>
+      <div class="row end" style="margin-top:12px">
+        <button id="btn-salvar-urls">Salvar URLs</button>
+      </div>
+      <p class="hint">As URLs ficam salvas no localStorage deste navegador.</p>
+      <div id="msg-config" class="msg"></div>
+    </details>
+  </section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="comprador">Área do Comprador</button>
+    <button class="tab" data-tab="colaborador">Área do Colaborador (Sebo)</button>
+  </nav>
+
+  <!--  ÁREA DO COMPRADOR -->
+  <section id="panel-comprador" class="panel active">
+    <div class="card">
+      <h2>Solicitar um livro <small>— reserva imediata se houver estoque, ou entra na fila de espera</small></h2>
+      <form id="form-solicitar" class="grid grid-2">
+        <div>
+          <label for="sol-nome">Seu nome</label>
+          <input id="sol-nome" required placeholder="Maria Silva" />
+        </div>
+        <div>
+          <label for="sol-email">Seu e-mail</label>
+          <input id="sol-email" type="email" required placeholder="maria@email.com" />
+        </div>
+        <div>
+          <label for="sol-titulo">Título do livro</label>
+          <input id="sol-titulo" required placeholder="Dom Casmurro" />
+        </div>
+        <div>
+          <label for="sol-livro-id">Código do livro (opcional)</label>
+          <input id="sol-livro-id" placeholder="dom-casmurro" />
+        </div>
+        <div class="row end" style="grid-column: 1 / -1">
+          <button type="submit" id="btn-solicitar">Quero este livro</button>
+        </div>
+      </form>
+      <div id="msg-solicitar" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">Acervo do sebo</h2>
+        <span class="spacer"></span>
+        <button class="secondary small" id="btn-listar">Atualizar</button>
+      </div>
+      <div id="tabela-acervo" class="table-wrap" style="margin-top:12px"><p class="empty">Carregando…</p></div>
+    </div>
+
+    <div class="card">
+      <h2>Meus pedidos</h2>
+      <form id="form-meus" class="row">
+        <input id="meus-email" type="email" required placeholder="seu e-mail" style="flex:1; min-width:200px" />
+        <button type="submit" id="btn-meus">Consultar</button>
+      </form>
+      <div id="msg-meus" class="msg"></div>
+      <div id="tabela-meus" class="table-wrap" style="margin-top:12px"></div>
+    </div>
+  </section>
+
+  <!--  ÁREA DO COLABORADOR  -->
+  <section id="panel-colaborador" class="panel">
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">Resumo</h2>
+        <span class="spacer"></span>
+        <button class="secondary small" id="btn-painel">Atualizar painel</button>
+      </div>
+      <div class="grid grid-4" style="margin-top:12px">
+        <div class="stat"><div class="valor" id="r-titulos">–</div><div class="rotulo">Títulos no acervo</div></div>
+        <div class="stat"><div class="valor" id="r-exemplares">–</div><div class="rotulo">Exemplares disponíveis</div></div>
+        <div class="stat"><div class="valor" id="r-vendas">–</div><div class="rotulo">Vendas / reservas</div></div>
+        <div class="stat"><div class="valor" id="r-fila">–</div><div class="rotulo">Clientes na fila de espera</div></div>
+      </div>
+      <div id="msg-painel" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>Cadastrar ou repor livro <small>— a fila de espera é atendida automaticamente pelo notificador</small></h2>
+      <form id="form-repor" class="grid grid-2">
+        <div>
+          <label for="rep-titulo">Título</label>
+          <input id="rep-titulo" required placeholder="Dom Casmurro" />
+        </div>
+        <div>
+          <label for="rep-autor">Autor</label>
+          <input id="rep-autor" placeholder="Machado de Assis" />
+        </div>
+        <div>
+          <label for="rep-preco">Preço (R$)</label>
+          <input id="rep-preco" inputmode="decimal" placeholder="25.00" />
+        </div>
+        <div>
+          <label for="rep-qtd">Exemplares chegando</label>
+          <input id="rep-qtd" type="number" min="0" step="1" value="1" required />
+        </div>
+        <div class="row end" style="grid-column: 1 / -1">
+          <button type="submit" id="btn-repor">Registrar entrada</button>
+        </div>
+      </form>
+      <div id="msg-repor" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>Estoque por livro</h2>
+      <div id="tabela-estoque" class="table-wrap"><p class="empty">Carregando…</p></div>
+    </div>
+
+    <div class="card">
+      <h2>Pedidos (vendas e fila de espera)</h2>
+      <div id="tabela-pedidos" class="table-wrap"><p class="empty">Carregando…</p></div>
+    </div>
+  </section>
+</div>
+
+<script>
+  // ------------------------------
+  // Configuração (URLs salvas no localStorage)
+  // ------------------------------
+  const CHAVE_COMPRADOR = "LAMBDA_COMPRADOR_URL";
+  const CHAVE_COLABORADOR = "LAMBDA_COLABORADOR_URL";
+
+  function lerStorage(chave) {
+    try { return localStorage.getItem(chave) || ""; } catch (e) { return ""; }
+  }
+  function gravarStorage(chave, valor) {
+    try { localStorage.setItem(chave, valor); } catch (e) { /* navegador sem storage: segue só na sessão */ }
+  }
+
+  const config = {
+    comprador: lerStorage(CHAVE_COMPRADOR),
+    colaborador: lerStorage(CHAVE_COLABORADOR),
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  function escapar(valor) {
+    return String(valor ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+
+  function mostrarMsg(id, texto, tipo) {
+    const el = $(id);
+    el.className = "msg show " + tipo;
+    el.textContent = texto;
+  }
+  function esconderMsg(id) { $(id).className = "msg"; }
+
+  function formatarData(iso) {
+    if (!iso) return "–";
+    const d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString("pt-BR");
+  }
+
+  function formatarPreco(preco) {
+    const n = Number(preco);
+    return isNaN(n) || n === 0 ? "–" : n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+  }
+
+  const STATUS_INFO = {
+    DISPONIVEL_NOTIFICADO: ["Separado (estoque imediato)", "ok"],
+    CHEGOU_NOTIFICADO: ["Chegou — cliente avisado", "info"],
+    AGUARDANDO_ESTOQUE: ["Na fila de espera", "warn"],
+  };
+  function badgeStatus(status) {
+    const [texto, tipo] = STATUS_INFO[status] || [status || "–", "info"];
+    return `<span class="badge ${tipo}">${escapar(texto)}</span>`;
+  }
+
+  // ------------------------------
+  // Chamada às Lambdas
+  // ------------------------------
+  // O corpo vai como text/plain para ser uma "requisição simples" (sem preflight CORS);
+  // a Lambda faz json.loads do body independentemente do Content-Type.
+  async function chamarLambda(qual, payload) {
+    const url = config[qual];
+    if (!url) {
+      $("config-box").open = true;
+      throw new Error("Configure a Function URL da Lambda do " + (qual === "comprador" ? "Comprador" : "Colaborador") + " no topo da página.");
+    }
+    const resposta = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=UTF-8" },
+      body: JSON.stringify(payload),
+    });
+    let dados;
+    try { dados = await resposta.json(); }
+    catch (e) { throw new Error(`Resposta inválida da Lambda (HTTP ${resposta.status}).`); }
+    if (!resposta.ok || dados.sucesso === false) {
+      throw new Error(dados.mensagem || `Erro HTTP ${resposta.status}`);
+    }
+    return dados;
+  }
+
+  async function comBotao(botao, fn) {
+    botao.disabled = true;
+    try { await fn(); } finally { botao.disabled = false; }
+  }
+
+  // ------------------------------
+  // Abas
+  // ------------------------------
+  document.querySelectorAll(".tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
+      document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "panel-" + tab.dataset.tab));
+      if (tab.dataset.tab === "colaborador") carregarPainel();
+      else carregarAcervo();
+    });
+  });
+
+  // ------------------------------
+  // Configuração
+  // ------------------------------
+  $("url-comprador").value = config.comprador;
+  $("url-colaborador").value = config.colaborador;
+  if (!config.comprador || !config.colaborador) $("config-box").open = true;
+
+  $("btn-salvar-urls").addEventListener("click", () => {
+    config.comprador = $("url-comprador").value.trim();
+    config.colaborador = $("url-colaborador").value.trim();
+    gravarStorage(CHAVE_COMPRADOR, config.comprador);
+    gravarStorage(CHAVE_COLABORADOR, config.colaborador);
+    mostrarMsg("msg-config", "URLs salvas.", "ok");
+    carregarAcervo();
+  });
+
+  // ------------------------------
+  // Comprador: acervo
+  // ------------------------------
+  async function carregarAcervo() {
+    const alvo = $("tabela-acervo");
+    try {
+      const dados = await chamarLambda("comprador", { acao: "listar_livros" });
+      if (!dados.livros.length) {
+        alvo.innerHTML = '<p class="empty">Nenhum livro cadastrado ainda.</p>';
+        return;
+      }
+      const linhas = dados.livros.map((l) => {
+        const qtd = Number(l.quantidade || 0);
+        const disp = qtd > 0
+          ? `<span class="badge ok">${qtd} disponível(is)</span>`
+          : `<span class="badge warn">Esgotado — aceita encomenda</span>`;
+        return `<tr>
+          <td class="wrap"><strong>${escapar(l.titulo)}</strong><br><small style="color:var(--muted)">${escapar(l.livro_id)}</small></td>
+          <td class="wrap">${escapar(l.autor)}</td>
+          <td class="num">${formatarPreco(l.preco)}</td>
+          <td>${disp}</td>
+          <td><button class="small secondary" data-escolher="${escapar(l.livro_id)}" data-titulo="${escapar(l.titulo)}">${qtd > 0 ? "Reservar" : "Encomendar"}</button></td>
+        </tr>`;
+      }).join("");
+      alvo.innerHTML = `<table>
+        <thead><tr><th>Título</th><th>Autor</th><th class="num">Preço</th><th>Disponibilidade</th><th></th></tr></thead>
+        <tbody>${linhas}</tbody></table>`;
+    } catch (e) {
+      alvo.innerHTML = `<p class="empty">${escapar(e.message)}</p>`;
+    }
+  }
+
+  // Clicar em "Reservar/Encomendar" preenche o formulário de solicitação
+  $("tabela-acervo").addEventListener("click", (ev) => {
+    const botao = ev.target.closest("[data-escolher]");
+    if (!botao) return;
+    $("sol-titulo").value = botao.dataset.titulo;
+    $("sol-livro-id").value = botao.dataset.escolher;
+    $("form-solicitar").scrollIntoView({ behavior: "smooth", block: "start" });
+    ($("sol-nome").value ? $("btn-solicitar") : $("sol-nome")).focus();
+  });
+
+  // ------------------------------
+  // Comprador: solicitar livro
+  // ------------------------------
+  $("sol-nome").value = lerStorage("comprador_nome");
+  $("sol-email").value = lerStorage("comprador_email");
+  $("meus-email").value = lerStorage("comprador_email");
+
+  $("form-solicitar").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    esconderMsg("msg-solicitar");
+    comBotao($("btn-solicitar"), async () => {
+      const payload = {
+        acao: "solicitar_livro",
+        titulo: $("sol-titulo").value.trim(),
+        comprador_nome: $("sol-nome").value.trim(),
+        comprador_email: $("sol-email").value.trim(),
+      };
+      const livroId = $("sol-livro-id").value.trim();
+      if (livroId) payload.livro_id = livroId;
+
+      gravarStorage("comprador_nome", payload.comprador_nome);
+      gravarStorage("comprador_email", payload.comprador_email);
+
+      try {
+        const dados = await chamarLambda("comprador", payload);
+        let texto = dados.mensagem;
+        if (dados.disponivel_imediato && !dados.email_enviado) {
+          texto += " (Atenção: o e-mail via SNS não pôde ser enviado.)";
+        }
+        mostrarMsg("msg-solicitar", texto, dados.disponivel_imediato ? "ok" : "warn");
+        $("sol-titulo").value = "";
+        $("sol-livro-id").value = "";
+        $("meus-email").value = payload.comprador_email;
+        carregarAcervo();
+        carregarMeusPedidos();
+      } catch (e) {
+        mostrarMsg("msg-solicitar", e.message, "err");
+      }
+    });
+  });
+
+  // ------------------------------
+  // Comprador: meus pedidos
+  // ------------------------------
+  async function carregarMeusPedidos() {
+    const email = $("meus-email").value.trim();
+    if (!email) return;
+    esconderMsg("msg-meus");
+    const alvo = $("tabela-meus");
+    try {
+      const dados = await chamarLambda("comprador", { acao: "meus_pedidos", comprador_email: email });
+      if (!dados.pedidos.length) {
+        alvo.innerHTML = '<p class="empty">Nenhum pedido encontrado para este e-mail.</p>';
+        return;
+      }
+      alvo.innerHTML = tabelaPedidos(dados.pedidos, false);
+    } catch (e) {
+      alvo.innerHTML = "";
+      mostrarMsg("msg-meus", e.message, "err");
+    }
+  }
+
+  $("form-meus").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    comBotao($("btn-meus"), carregarMeusPedidos);
+  });
+
+  function tabelaPedidos(pedidos, mostrarComprador) {
+    const linhas = pedidos.map((p) => `<tr>
+      <td>${escapar(p.pedido_id)}</td>
+      <td class="wrap">${escapar(p.titulo)}</td>
+      ${mostrarComprador ? `<td class="wrap">${escapar(p.comprador_nome)}<br><small style="color:var(--muted)">${escapar(p.comprador_email)}</small></td>` : ""}
+      <td>${badgeStatus(p.status)}</td>
+      <td>${formatarData(p.criado_em)}</td>
+      <td>${formatarData(p.notificado_em)}</td>
+    </tr>`).join("");
+    return `<table>
+      <thead><tr><th>Pedido</th><th>Livro</th>${mostrarComprador ? "<th>Comprador</th>" : ""}<th>Status</th><th>Criado em</th><th>Avisado em</th></tr></thead>
+      <tbody>${linhas}</tbody></table>`;
+  }
+
+  // ------------------------------
+  // Colaborador: painel
+  // ------------------------------
+  async function carregarPainel() {
+    esconderMsg("msg-painel");
+    try {
+      const dados = await chamarLambda("colaborador", { acao: "painel_estoque" });
+      const r = dados.resumo || {};
+      $("r-titulos").textContent = r.total_titulos ?? "–";
+      $("r-exemplares").textContent = r.total_exemplares_disponiveis ?? "–";
+      $("r-vendas").textContent = r.total_vendas_reservadas ?? "–";
+      $("r-fila").textContent = r.total_fila_espera ?? "–";
+
+      $("tabela-estoque").innerHTML = dados.livros.length
+        ? `<table>
+            <thead><tr><th>Título</th><th>Autor</th><th class="num">Preço</th><th class="num">Em estoque</th><th class="num">Vendidos</th><th class="num">Aguardando</th><th>Atualizado em</th></tr></thead>
+            <tbody>${dados.livros.map((l) => `<tr>
+              <td class="wrap"><strong>${escapar(l.titulo)}</strong><br><small style="color:var(--muted)">${escapar(l.livro_id)}</small></td>
+              <td class="wrap">${escapar(l.autor)}</td>
+              <td class="num">${formatarPreco(l.preco)}</td>
+              <td class="num">${escapar(l.quantidade ?? 0)}</td>
+              <td class="num">${escapar(l.total_vendidos ?? 0)}</td>
+              <td class="num">${Number(l.clientes_aguardando) > 0 ? `<span class="badge warn">${escapar(l.clientes_aguardando)}</span>` : "0"}</td>
+              <td>${formatarData(l.atualizado_em)}</td>
+            </tr>`).join("")}</tbody></table>`
+        : '<p class="empty">Nenhum livro cadastrado ainda.</p>';
+
+      $("tabela-pedidos").innerHTML = dados.pedidos.length
+        ? tabelaPedidos(dados.pedidos, true)
+        : '<p class="empty">Nenhum pedido registrado ainda.</p>';
+    } catch (e) {
+      mostrarMsg("msg-painel", e.message, "err");
+      $("tabela-estoque").innerHTML = "";
+      $("tabela-pedidos").innerHTML = "";
+    }
+  }
+
+  $("btn-painel").addEventListener("click", (ev) => comBotao(ev.currentTarget, carregarPainel));
+  $("btn-listar").addEventListener("click", (ev) => comBotao(ev.currentTarget, carregarAcervo));
+
+  // ------------------------------
+  // Colaborador: cadastrar / repor
+  // ------------------------------
+  $("form-repor").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    esconderMsg("msg-repor");
+    comBotao($("btn-repor"), async () => {
+      const payload = {
+        acao: "cadastrar_ou_repor_livro",
+        titulo: $("rep-titulo").value.trim(),
+        autor: $("rep-autor").value.trim(),
+        preco: $("rep-preco").value.trim().replace(",", "."),
+        quantidade_adicional: parseInt($("rep-qtd").value, 10) || 0,
+      };
+      try {
+        const dados = await chamarLambda("colaborador", payload);
+        mostrarMsg("msg-repor", dados.mensagem, "ok");
+        await carregarPainel();
+        // O notificador roda de forma assíncrona (DynamoDB Stream); recarrega após alguns segundos
+        // para mostrar a fila de espera sendo atendida.
+        setTimeout(carregarPainel, 4000);
+      } catch (e) {
+        mostrarMsg("msg-repor", e.message, "err");
+      }
+    });
+  });
+
+  // ------------------------------
+  // Inicialização
+  // ------------------------------
+  if (config.comprador) {
+    carregarAcervo();
+    if ($("meus-email").value) carregarMeusPedidos();
+  } else {
+    $("tabela-acervo").innerHTML = '<p class="empty">Configure as Function URLs no topo da página.</p>';
+  }
+</script>
+</body>
+</html>
