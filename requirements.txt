@@ -1,4 +1,5 @@
-# Dependências dos clientes de terminal (interfaces/cli_*.py).
-# As Lambdas usam apenas a biblioteca padrão do Python 3.12 + boto3 (já incluso no runtime da AWS).
+# Dependências locais para os clientes de terminal (interfaces/cli_*.py) e scripts (scripts/*.py).
+# As Lambdas na AWS usam apenas a biblioteca padrão do Python 3.12 + boto3 nativo do runtime.
+boto3>=1.34
 requests>=2.31
 python-dotenv>=1.0
