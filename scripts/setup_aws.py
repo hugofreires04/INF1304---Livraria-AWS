@@ -6,12 +6,15 @@ Cria ou atualiza todos os recursos necessários para o Sebo Serverless na conta 
 2. Tópico Amazon SNS: SeboNotificacoes (com opção de inscrever um e-mail via argumento);
 3. Três funções AWS Lambda usando a role existente LabRole;
 4. Function URLs públicas (com CORS) para as Lambdas do Comprador e do Colaborador;
-5. Gatilho (Event Source Mapping) ligando o Stream de SeboLivros à Lambda Notificadora;
+5. Gatilho (Event Source Mapping) ligando o Stream de SeboLivros à Lambda Notificadora,
+   com reprocessamento por registro (ReportBatchItemFailures), limite de tentativas e
+   fila SQS de falhas (Dead-Letter Queue) para os registros que esgotarem as tentativas;
 6. Gravação automática das Function URLs geradas no arquivo .env da raiz do projeto.
 
 Uso:
   python scripts/setup_aws.py
   python scripts/setup_aws.py --email seu_email@exemplo.com
+  python scripts/setup_aws.py --email seu_email@exemplo.com --filtrar-por-email
 """
 
 import argparse
@@ -31,6 +34,8 @@ REGIAO_AWS = os.environ.get("AWS_REGION", "us-east-1")
 NOME_TABELA_LIVROS = "SeboLivros"
 NOME_TABELA_PEDIDOS = "SeboPedidos"
 NOME_TOPICO_SNS = "SeboNotificacoes"
+NOME_FILA_FALHAS = "SeboNotificadorFalhas"
+MAXIMO_TENTATIVAS_STREAM = 3
 
 CONFIG_LAMBDAS = [
     {
@@ -113,18 +118,30 @@ def garantir_tabela_dynamodb(dynamodb_client, nome_tabela: str, chave_particao: 
     return descricao
 
 
-def garantir_topico_sns(sns_client, nome_topico: str, email_assinante: str | None = None) -> str:
-    """Cria (ou recupera) o tópico SNS e opcionalmente cadastra um e-mail como assinante."""
+def garantir_topico_sns(sns_client, nome_topico: str, email_assinante: str | None = None,
+                        filtrar_por_email: bool = False) -> str:
+    """
+    Cria (ou recupera) o tópico SNS e opcionalmente cadastra um e-mail como assinante.
+    Com 'filtrar_por_email', a assinatura recebe uma Filter Policy pelo atributo 'comprador_email'
+    (publicado pelas Lambdas 1 e 3), e o assinante passa a receber apenas os avisos dos próprios pedidos.
+    """
     resposta = sns_client.create_topic(Name=nome_topico)
     topic_arn = resposta["TopicArn"]
     print(f"  [OK] Tópico SNS pronto: {topic_arn}")
 
     if email_assinante:
-        sns_client.subscribe(
-            TopicArn=topic_arn,
-            Protocol="email",
-            Endpoint=email_assinante.strip(),
-        )
+        parametros = {
+            "TopicArn": topic_arn,
+            "Protocol": "email",
+            "Endpoint": email_assinante.strip(),
+        }
+        if filtrar_por_email:
+            parametros["Attributes"] = {
+                "FilterPolicy": json.dumps({"comprador_email": [email_assinante.strip()]}),
+            }
+        sns_client.subscribe(**parametros)
+        if filtrar_por_email:
+            print(f"  [OK] Assinatura com Filter Policy: só recebe avisos de pedidos feitos com '{email_assinante}'.")
         print(
             f"  [!] Convite SNS enviado para '{email_assinante}'. "
             f"Abra sua caixa de entrada e clique em 'Confirm subscription'!"
@@ -255,8 +272,41 @@ def garantir_function_url(lambda_client, nome_funcao: str) -> str:
     return function_url
 
 
-def garantir_trigger_stream(lambda_client, nome_funcao: str, stream_arn: str) -> None:
-    """Conecta o DynamoDB Stream da tabela SeboLivros como gatilho da Lambda Notificadora."""
+def garantir_fila_falhas(sqs_client, nome_fila: str) -> str | None:
+    """
+    Cria (ou recupera) a fila SQS que recebe os registros do Stream que falharam em todas as tentativas.
+    Retorna o ARN da fila, ou None se não for possível criá-la (o gatilho segue funcionando sem ela).
+    """
+    try:
+        url_fila = sqs_client.create_queue(
+            QueueName=nome_fila,
+            Attributes={"MessageRetentionPeriod": str(14 * 24 * 3600)},
+        )["QueueUrl"]
+        arn_fila = sqs_client.get_queue_attributes(
+            QueueUrl=url_fila, AttributeNames=["QueueArn"]
+        )["Attributes"]["QueueArn"]
+        print(f"  [OK] Fila de falhas (DLQ) pronta: {arn_fila}")
+        return arn_fila
+    except ClientError as erro:
+        print(f"  [AVISO] Não foi possível criar a fila de falhas '{nome_fila}': {erro}")
+        return None
+
+
+def garantir_trigger_stream(lambda_client, nome_funcao: str, stream_arn: str, arn_fila_falhas: str | None) -> None:
+    """
+    Conecta o DynamoDB Stream da tabela SeboLivros como gatilho da Lambda Notificadora.
+    - ReportBatchItemFailures: a Lambda informa quais registros falharam e só eles (e os seguintes) são reenviados;
+    - MaximumRetryAttempts: limita as tentativas para um registro com erro não travar o Stream;
+    - OnFailure: registros que esgotarem as tentativas vão para a fila SQS de falhas.
+    """
+    configuracao_erros = {
+        "FunctionResponseTypes": ["ReportBatchItemFailures"],
+        "MaximumRetryAttempts": MAXIMO_TENTATIVAS_STREAM,
+        "BisectBatchOnFunctionError": True,
+    }
+    if arn_fila_falhas:
+        configuracao_erros["DestinationConfig"] = {"OnFailure": {"Destination": arn_fila_falhas}}
+
     mapeamentos = lambda_client.list_event_source_mappings(
         FunctionName=nome_funcao,
         EventSourceArn=stream_arn,
@@ -266,8 +316,8 @@ def garantir_trigger_stream(lambda_client, nome_funcao: str, stream_arn: str) ->
         uuid_mapeamento = mapeamentos[0]["UUID"]
         estado = mapeamentos[0].get("State", "")
         print(f"  [OK] Trigger DynamoDB Stream já conectado (UUID: {uuid_mapeamento}, Estado: {estado}).")
-        if estado in ("Disabled", "Disabling"):
-            lambda_client.update_event_source_mapping(UUID=uuid_mapeamento, Enabled=True)
+        lambda_client.update_event_source_mapping(UUID=uuid_mapeamento, Enabled=True, **configuracao_erros)
+        print("  [OK] Configuração de reprocessamento e fila de falhas atualizada.")
         return
 
     print(f"  [..] Conectando DynamoDB Stream à Lambda '{nome_funcao}'...")
@@ -277,6 +327,7 @@ def garantir_trigger_stream(lambda_client, nome_funcao: str, stream_arn: str) ->
         Enabled=True,
         BatchSize=5,
         StartingPosition="LATEST",
+        **configuracao_erros,
     )
     print(f"  [OK] Gatilho DynamoDB Stream ativado para '{nome_funcao}'!")
 
@@ -301,7 +352,17 @@ def main():
         help="E-mail opcional para já cadastrar como assinante no tópico Amazon SNS.",
         default=None,
     )
+    parser.add_argument(
+        "--filtrar-por-email",
+        action="store_true",
+        help=(
+            "Aplica uma Filter Policy na assinatura do --email, para que ele receba apenas os avisos "
+            "dos pedidos feitos com esse e-mail (sem a opção, recebe os avisos de todos os pedidos)."
+        ),
+    )
     args = parser.parse_args()
+    if args.filtrar_por_email and not args.email:
+        parser.error("--filtrar-por-email exige --email.")
 
     print("=" * 72)
     print("  PROVISIONAMENTO AUTOMATIZADO - SEBO SERVERLESS NA AWS (us-east-1)")
@@ -313,6 +374,7 @@ def main():
     dynamodb_client = sessao.client("dynamodb")
     sns_client = sessao.client("sns")
     lambda_client = sessao.client("lambda")
+    sqs_client = sessao.client("sqs")
 
     identidade = sts_client.get_caller_identity()
     role_arn = obter_lab_role_arn(iam_client, sts_client)
@@ -329,7 +391,9 @@ def main():
     stream_arn = tabela_livros_desc.get("LatestStreamArn")
 
     print("\n3. Verificando/Criando tópico no Amazon SNS...")
-    topic_arn = garantir_topico_sns(sns_client, NOME_TOPICO_SNS, email_assinante=args.email)
+    topic_arn = garantir_topico_sns(
+        sns_client, NOME_TOPICO_SNS, email_assinante=args.email, filtrar_por_email=args.filtrar_por_email
+    )
 
     print("\n4. Implantando as 3 funções AWS Lambda...")
     urls_geradas = {}
@@ -341,7 +405,8 @@ def main():
 
     print("\n5. Configurando gatilho do DynamoDB Stream na Lambda 3...")
     if stream_arn:
-        garantir_trigger_stream(lambda_client, "sebo-notificador-estoque", stream_arn)
+        arn_fila_falhas = garantir_fila_falhas(sqs_client, NOME_FILA_FALHAS)
+        garantir_trigger_stream(lambda_client, "sebo-notificador-estoque", stream_arn, arn_fila_falhas)
     else:
         print("  [AVISO] LatestStreamArn não encontrado na tabela SeboLivros.")
 

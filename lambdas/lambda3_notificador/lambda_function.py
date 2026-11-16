@@ -104,8 +104,9 @@ def enviar_notificacao_email(assunto: str, mensagem: str, comprador_email: str) 
 
 def extrair_livros_do_evento(event: dict) -> list:
     """
-    Monta a lista de livros a processar a partir do evento recebido.
-    - Evento do DynamoDB Stream: usa o NewImage de cada registro INSERT/MODIFY.
+    Monta a lista de pares (livro, numero_sequencia) a processar a partir do evento recebido.
+    - Evento do DynamoDB Stream: usa o NewImage de cada registro INSERT/MODIFY e guarda o
+      SequenceNumber do registro, usado para pedir o reprocessamento em caso de falha.
     - Invocação direta de teste: busca o livro informado em 'livro_id' (ou 'titulo') na tabela.
     """
     registros = event.get("Records")
@@ -122,7 +123,7 @@ def extrair_livros_do_evento(event: dict) -> list:
         if not item:
             print(f"[NOTIFICADOR] Livro '{livro_id}' não encontrado na tabela {NOME_TABELA_LIVROS}.")
             return []
-        return [item]
+        return [(item, None)]
 
     livros = []
     for registro in registros:
@@ -130,11 +131,12 @@ def extrair_livros_do_evento(event: dict) -> list:
         if nome_evento not in ("INSERT", "MODIFY"):
             continue
 
-        imagem_nova = registro.get("dynamodb", {}).get("NewImage")
+        dados_stream = registro.get("dynamodb", {})
+        imagem_nova = dados_stream.get("NewImage")
         if not imagem_nova:
             continue
 
-        livros.append(desserializar_imagem(imagem_nova))
+        livros.append((desserializar_imagem(imagem_nova), dados_stream.get("SequenceNumber")))
     return livros
 
 
@@ -142,6 +144,7 @@ def buscar_fila_de_espera(livro_id: str) -> list:
     """
     Retorna os pedidos AGUARDANDO_ESTOQUE de um livro, ordenados por 'criado_em'
     crescente (FIFO: quem entrou primeiro na fila é atendido primeiro).
+    Pedidos criados no mesmo segundo são desempatados pelo 'pedido_id', a mesma ordem usada pela Lambda do Comprador.
     """
     filtro = Attr("livro_id").eq(livro_id) & Attr("status").eq("AGUARDANDO_ESTOQUE")
     parametros = {"FilterExpression": filtro, "ConsistentRead": True}
@@ -155,7 +158,7 @@ def buscar_fila_de_espera(livro_id: str) -> list:
             break
         parametros["ExclusiveStartKey"] = chave_continuacao
 
-    pedidos.sort(key=lambda p: p.get("criado_em", ""))
+    pedidos.sort(key=lambda p: (p.get("criado_em", ""), p.get("pedido_id", "")))
     return pedidos
 
 
@@ -312,19 +315,24 @@ def atender_fila_do_livro(livro: dict) -> list:
 def lambda_handler(event, context):
     """
     Ponto de entrada da função Lambda.
-    Processa cada livro do evento de forma independente: um erro em um registro é
-    registrado no log sem impedir o processamento dos demais.
+    Processa cada livro do evento de forma independente: um erro em um registro não impede
+    o processamento dos demais. Os registros do Stream que falharem são devolvidos em
+    'batchItemFailures', para que a AWS os reenvie (requer ReportBatchItemFailures no gatilho).
+    O reprocessamento é seguro porque reservas e mudanças de status usam condições atômicas.
     """
     livros = extrair_livros_do_evento(event if isinstance(event, dict) else {})
     pedidos_atendidos = []
     erros = []
+    falhas_lote = []
 
-    for livro in livros:
+    for livro, numero_sequencia in livros:
         try:
             pedidos_atendidos.extend(atender_fila_do_livro(livro))
         except Exception as erro:
             print(f"[ERRO LAMBDA NOTIFICADOR] Livro '{livro.get('livro_id')}': {erro}")
             erros.append({"livro_id": livro.get("livro_id"), "erro": str(erro)})
+            if numero_sequencia:
+                falhas_lote.append({"itemIdentifier": numero_sequencia})
 
     resultado = {
         "sucesso": not erros,
@@ -332,6 +340,7 @@ def lambda_handler(event, context):
         "total_atendidos": len(pedidos_atendidos),
         "pedidos_atendidos": pedidos_atendidos,
         "erros": erros,
+        "batchItemFailures": falhas_lote,
     }
     print(f"[NOTIFICADOR] Resultado: {resultado}")
     return resultado

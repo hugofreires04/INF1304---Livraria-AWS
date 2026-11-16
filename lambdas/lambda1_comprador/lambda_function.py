@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
+from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
 # Configuração do ambiente e clientes AWS
@@ -91,10 +92,18 @@ def agora_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def escanear_tabela_completa(tabela) -> list:
+def agora_iso_milissegundos() -> str:
+    """
+    Retorna o timestamp atual em UTC no formato ISO 8601 com milissegundos (ex: 2026-11-08T19:45:00.123Z).
+    Usado em 'criado_em' dos pedidos, que define a ordem da fila de espera.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def escanear_tabela_completa(tabela, **parametros_scan) -> list:
     """Lê todos os itens de uma tabela DynamoDB percorrendo todas as páginas (LastEvaluatedKey)."""
     itens = []
-    parametros = {}
+    parametros = dict(parametros_scan)
     while True:
         resposta = tabela.scan(**parametros)
         itens.extend(resposta.get("Items", []))
@@ -269,11 +278,30 @@ def promover_pedido_para_disponivel(pedido_id: str, momento: str) -> bool:
         raise
 
 
+def existe_pedido_anterior_na_fila(livro_id: str, referencia: tuple | None = None) -> bool:
+    """
+    Indica se há pedidos AGUARDANDO_ESTOQUE para o livro que devem ser atendidos antes.
+    Sem 'referencia', considera qualquer pedido na fila. Com 'referencia' = (criado_em, pedido_id),
+    considera apenas os pedidos mais antigos que ela (mesma ordem FIFO usada pelo notificador).
+    """
+    filtro = Attr("livro_id").eq(livro_id) & Attr("status").eq("AGUARDANDO_ESTOQUE")
+    fila = escanear_tabela_completa(tabela_pedidos, FilterExpression=filtro, ConsistentRead=True)
+
+    for pedido in fila:
+        if pedido.get("livro_id") != livro_id or pedido.get("status") != "AGUARDANDO_ESTOQUE":
+            continue
+        if referencia is None:
+            return True
+        if (pedido.get("criado_em", ""), pedido.get("pedido_id", "")) < referencia:
+            return True
+    return False
+
+
 def solicitar_livro(dados: dict) -> dict:
     """
     Registra o pedido de compra de um livro.
-    Se houver estoque disponível, grava o pedido, reserva o exemplar e envia confirmação via SNS.
-    Caso contrário, salva o pedido como AGUARDANDO_ESTOQUE na fila de espera.
+    Se houver estoque disponível e ninguém aguardando na fila, grava o pedido, reserva o exemplar
+    e envia confirmação via SNS. Caso contrário, salva o pedido como AGUARDANDO_ESTOQUE na fila de espera.
     """
     titulo_informado = (dados.get("titulo") or "").strip()
     livro_id = (dados.get("livro_id") or "").strip() or normalizar_livro_id(titulo_informado)
@@ -287,9 +315,13 @@ def solicitar_livro(dados: dict) -> dict:
         })
 
     pedido_id = f"PED-{uuid.uuid4().hex[:8].upper()}"
-    momento_atual = agora_iso()
+    momento_atual = agora_iso_milissegundos()
 
-    livro_reservado = tentar_reservar_estoque_atomico(livro_id)
+    # Se já há clientes na fila, o exemplar disponível pertence a eles: o novo pedido entra no fim da fila
+    if existe_pedido_anterior_na_fila(livro_id):
+        livro_reservado = None
+    else:
+        livro_reservado = tentar_reservar_estoque_atomico(livro_id)
 
     # Caso 1: Livro disponível em estoque -> persiste o pedido primeiro e depois envia o e-mail
     if livro_reservado is not None:
@@ -361,8 +393,11 @@ def solicitar_livro(dados: dict) -> dict:
     tabela_pedidos.put_item(Item=registro_pedido)
 
     # Nova checagem atômica: cobre o caso em que o estoque foi reposto exatamente
-    # entre a primeira tentativa e a gravação do pedido na fila
-    livro_reposto = tentar_reservar_estoque_atomico(livro_id)
+    # entre a primeira tentativa e a gravação do pedido na fila.
+    # Só tenta se este pedido for o primeiro da fila, para não passar à frente de quem chegou antes.
+    livro_reposto = None
+    if not existe_pedido_anterior_na_fila(livro_id, (momento_atual, pedido_id)):
+        livro_reposto = tentar_reservar_estoque_atomico(livro_id)
     if livro_reposto is not None:
         if promover_pedido_para_disponivel(pedido_id, momento_atual):
             assunto, corpo_email = montar_email_disponivel(
