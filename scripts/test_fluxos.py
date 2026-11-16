@@ -135,10 +135,21 @@ class TabelaDynamoDBMemoria:
             item_atual["total_vendidos"] = int(item_atual.get("total_vendidos", 0)) + int(valores[":um"])
             item_atual["atualizado_em"] = valores[":agora"]
 
+        elif "quantidade = quantidade + :um" in UpdateExpression:
+            item_atual["quantidade"] = int(item_atual.get("quantidade", 0)) + int(valores[":um"])
+            item_atual["total_vendidos"] = int(item_atual.get("total_vendidos", 0)) - int(valores[":um"])
+            item_atual["atualizado_em"] = valores[":agora"]
+
         elif "quantidade = if_not_exists(quantidade, :zero) + :qtd" in UpdateExpression:
-            item_atual["titulo"] = valores[":titulo"]
-            item_atual["autor"] = valores[":autor"]
-            item_atual["preco"] = valores[":preco"]
+            item_atual["titulo"] = item_atual.get("titulo") or valores[":titulo"]
+            if ":autor" in valores:
+                item_atual["autor"] = valores[":autor"]
+            else:
+                item_atual["autor"] = item_atual.get("autor") or valores.get(":autor_padrao", "Autor Desconhecido")
+            if ":preco" in valores:
+                item_atual["preco"] = valores[":preco"]
+            else:
+                item_atual["preco"] = item_atual.get("preco") or valores.get(":preco_padrao", "0.00")
             item_atual["quantidade"] = int(item_atual.get("quantidade", valores[":zero"])) + int(valores[":qtd"])
             item_atual["total_vendidos"] = int(item_atual.get("total_vendidos", valores[":zero"]))
             item_atual["atualizado_em"] = valores[":agora"]
@@ -146,6 +157,10 @@ class TabelaDynamoDBMemoria:
         elif "#status = :novo" in UpdateExpression:
             item_atual["status"] = valores[":novo"]
             item_atual["notificado_em"] = valores[":momento"]
+            item_atual["observacao"] = valores[":obs"]
+
+        elif "notificado_em = :nulo" in UpdateExpression:
+            item_atual["notificado_em"] = valores[":nulo"]
             item_atual["observacao"] = valores[":obs"]
 
         imagem_antiga = copy.deepcopy(self.itens.get(valor_pk))
