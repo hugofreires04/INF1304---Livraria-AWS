@@ -2,7 +2,7 @@
 Serviço do Colaborador (sebo-colaborador-service)
 
 Gerencia as operações internas da livraria (sebo):
-- Cadastro de novos livros e reposição de exemplares em estoque;
+- Cadastro de novos livros e reposição de exemplares em estoque (preservando autor e preço existentes);
 - Painel consolidado com catálogo, histórico de vendas e fila de espera por livro.
 """
 
@@ -86,15 +86,30 @@ def agora_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def escanear_tabela_completa(tabela) -> list:
+    """Lê todos os itens de uma tabela DynamoDB percorrendo todas as páginas (LastEvaluatedKey)."""
+    itens = []
+    parametros = {}
+    while True:
+        resposta = tabela.scan(**parametros)
+        itens.extend(resposta.get("Items", []))
+        chave_continuacao = resposta.get("LastEvaluatedKey")
+        if not chave_continuacao:
+            break
+        parametros["ExclusiveStartKey"] = chave_continuacao
+    return itens
+
+
 def cadastrar_ou_repor_livro(dados: dict) -> dict:
     """
     Cadastra um novo livro no acervo ou soma exemplares ao estoque existente.
+    Se 'autor' ou 'preco' não forem informados na reposição, preserva os valores já salvos no banco.
     A alteração na tabela SeboLivros aciona automaticamente o DynamoDB Stream para a Lambda 3.
     """
     titulo = (dados.get("titulo") or "").strip()
     livro_id = (dados.get("livro_id") or "").strip() or normalizar_livro_id(titulo)
-    autor = (dados.get("autor") or "Autor Desconhecido").strip()
-    preco = str(dados.get("preco") or "0.00").strip()
+    autor_informado = (dados.get("autor") or "").strip()
+    preco_informado = str(dados.get("preco") if dados.get("preco") is not None else "").strip()
 
     try:
         quantidade_adicional = int(dados.get("quantidade_adicional", dados.get("quantidade", 1)))
@@ -118,34 +133,48 @@ def cadastrar_ou_repor_livro(dados: dict) -> dict:
 
     momento_atual = agora_iso()
 
-    # Soma a quantidade_adicional ao estoque atual (ou inicializa em 0 se for livro novo)
+    # Preserva titulo, autor e preco existentes quando o colaborador faz apenas reposição de quantidade
+    expressao_titulo = "titulo = if_not_exists(titulo, :titulo)"
+    expressao_autor = "autor = :autor" if autor_informado else "autor = if_not_exists(autor, :autor_padrao)"
+    expressao_preco = "preco = :preco" if preco_informado else "preco = if_not_exists(preco, :preco_padrao)"
+
+    valores_expressao = {
+        ":titulo": titulo,
+        ":qtd": quantidade_adicional,
+        ":zero": 0,
+        ":agora": momento_atual,
+    }
+    if autor_informado:
+        valores_expressao[":autor"] = autor_informado
+    else:
+        valores_expressao[":autor_padrao"] = "Autor Desconhecido"
+
+    if preco_informado:
+        valores_expressao[":preco"] = preco_informado
+    else:
+        valores_expressao[":preco_padrao"] = "0.00"
+
     resposta = tabela_livros.update_item(
         Key={"livro_id": livro_id},
         UpdateExpression=(
-            "SET titulo = :titulo, "
-            "autor = :autor, "
-            "preco = :preco, "
+            f"SET {expressao_titulo}, "
+            f"{expressao_autor}, "
+            f"{expressao_preco}, "
             "quantidade = if_not_exists(quantidade, :zero) + :qtd, "
             "total_vendidos = if_not_exists(total_vendidos, :zero), "
             "atualizado_em = :agora"
         ),
-        ExpressionAttributeValues={
-            ":titulo": titulo,
-            ":autor": autor,
-            ":preco": preco,
-            ":qtd": quantidade_adicional,
-            ":zero": 0,
-            ":agora": momento_atual,
-        },
+        ExpressionAttributeValues=valores_expressao,
         ReturnValues="ALL_NEW",
     )
 
     livro_atualizado = resposta.get("Attributes", {})
+    titulo_exibicao = livro_atualizado.get("titulo", titulo)
 
     return montar_resposta(200, {
         "sucesso": True,
         "mensagem": (
-            f"Estoque atualizado com sucesso para '{titulo}'. "
+            f"Estoque atualizado com sucesso para '{titulo_exibicao}'. "
             f"Foram adicionadas {quantidade_adicional} unidade(s). "
             f"Caso existam clientes na fila de espera, eles serão notificados automaticamente."
         ),
@@ -160,8 +189,8 @@ def consultar_painel_estoque() -> dict:
     - Lista de pedidos (vendas imediatas, atendidos posteriormente e fila de espera);
     - Resumo numérico de estoque, vendas e encomendas pendentes.
     """
-    livros = tabela_livros.scan().get("Items", [])
-    pedidos = tabela_pedidos.scan().get("Items", [])
+    livros = escanear_tabela_completa(tabela_livros)
+    pedidos = escanear_tabela_completa(tabela_pedidos)
 
     livros.sort(key=lambda item: item.get("titulo", ""))
     pedidos.sort(key=lambda item: item.get("criado_em", ""), reverse=True)

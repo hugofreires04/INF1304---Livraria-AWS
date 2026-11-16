@@ -91,29 +91,53 @@ def agora_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def escanear_tabela_completa(tabela) -> list:
+    """Lê todos os itens de uma tabela DynamoDB percorrendo todas as páginas (LastEvaluatedKey)."""
+    itens = []
+    parametros = {}
+    while True:
+        resposta = tabela.scan(**parametros)
+        itens.extend(resposta.get("Items", []))
+        chave_continuacao = resposta.get("LastEvaluatedKey")
+        if not chave_continuacao:
+            break
+        parametros["ExclusiveStartKey"] = chave_continuacao
+    return itens
+
+
 def obter_arn_topico_sns() -> str:
     """Obtém o ARN do tópico SNS via variável de ambiente ou buscando pelo nome na conta."""
     arn_ambiente = os.environ.get("SNS_TOPIC_ARN", "").strip()
     if arn_ambiente:
         return arn_ambiente
 
-    resposta = sns_client.list_topics()
-    for topico in resposta.get("Topics", []):
-        arn = topico["TopicArn"]
-        if arn.endswith(f":{NOME_TOPICO_SNS}"):
-            return arn
+    paginador = sns_client.get_paginator("list_topics")
+    for pagina in paginador.paginate():
+        for topico in pagina.get("Topics", []):
+            arn = topico["TopicArn"]
+            if arn.endswith(f":{NOME_TOPICO_SNS}"):
+                return arn
 
     raise RuntimeError(f"Tópico SNS '{NOME_TOPICO_SNS}' não encontrado na conta AWS.")
 
 
-def enviar_notificacao_email(assunto: str, mensagem: str) -> bool:
-    """Publica um aviso por e-mail no tópico do Amazon SNS."""
+def enviar_notificacao_email(assunto: str, mensagem: str, comprador_email: str) -> bool:
+    """
+    Publica um aviso por e-mail no tópico do Amazon SNS.
+    Inclui 'comprador_email' em MessageAttributes para suportar Filter Policy por assinante.
+    """
     try:
         topic_arn = obter_arn_topico_sns()
         sns_client.publish(
             TopicArn=topic_arn,
             Subject=assunto[:100],
             Message=mensagem,
+            MessageAttributes={
+                "comprador_email": {
+                    "DataType": "String",
+                    "StringValue": comprador_email or "desconhecido",
+                },
+            },
         )
         return True
     except Exception as erro:
@@ -123,8 +147,7 @@ def enviar_notificacao_email(assunto: str, mensagem: str) -> bool:
 
 def listar_livros() -> dict:
     """Busca e retorna todos os livros registrados na tabela SeboLivros."""
-    resultado = tabela_livros.scan()
-    livros = resultado.get("Items", [])
+    livros = escanear_tabela_completa(tabela_livros)
     livros.sort(key=lambda item: item.get("titulo", ""))
 
     return montar_resposta(200, {
@@ -163,6 +186,22 @@ def tentar_reservar_estoque_atomico(livro_id: str) -> dict | None:
         raise
 
 
+def devolver_exemplar_ao_estoque(livro_id: str) -> None:
+    """Devolve 1 unidade ao estoque caso ocorra falha ao persistir o pedido ou corrida com o Stream."""
+    tabela_livros.update_item(
+        Key={"livro_id": livro_id},
+        UpdateExpression=(
+            "SET quantidade = quantidade + :um, "
+            "total_vendidos = total_vendidos - :um, "
+            "atualizado_em = :agora"
+        ),
+        ExpressionAttributeValues={
+            ":um": 1,
+            ":agora": agora_iso(),
+        },
+    )
+
+
 def garantir_livro_no_catalogo(livro_id: str, titulo: str) -> dict:
     """Garante que o livro solicitado exista na tabela SeboLivros (criando com estoque 0 se necessário)."""
     consulta = tabela_livros.get_item(Key={"livro_id": livro_id})
@@ -188,10 +227,52 @@ def garantir_livro_no_catalogo(livro_id: str, titulo: str) -> dict:
         return tabela_livros.get_item(Key={"livro_id": livro_id}).get("Item", novo_livro)
 
 
+def montar_email_disponivel(comprador_nome: str, comprador_email: str, titulo: str, livro_id: str, pedido_id: str, momento: str) -> tuple:
+    """Monta o assunto e o corpo do e-mail para exemplar disponível em estoque."""
+    assunto = f"[Sebo AWS] Livro disponivel para retirada: {titulo}"
+    corpo = (
+        f"Olá, {comprador_nome}!\n\n"
+        f"Boa notícia: o livro '{titulo}' está disponível em nosso estoque "
+        f"e um exemplar já foi separado para você (Pedido {pedido_id}).\n\n"
+        f"Por favor, compareça à livraria para concretizar a compra e retirar o seu livro.\n\n"
+        f"Dados do pedido:\n"
+        f"- Código: {pedido_id}\n"
+        f"- Livro: {titulo} ({livro_id})\n"
+        f"- Comprador: {comprador_nome} ({comprador_email})\n"
+        f"- Data/Hora: {momento}\n"
+    )
+    return assunto, corpo
+
+
+def promover_pedido_para_disponivel(pedido_id: str, momento: str) -> bool:
+    """
+    Atualiza o pedido recém-criado de AGUARDANDO_ESTOQUE para DISPONIVEL_NOTIFICADO
+    apenas se ele ainda não tiver sido atendido concorrentemente pela Lambda 3.
+    """
+    try:
+        tabela_pedidos.update_item(
+            Key={"pedido_id": pedido_id},
+            UpdateExpression="SET #status = :novo, notificado_em = :momento, observacao = :obs",
+            ConditionExpression="#status = :aguardando",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":novo": "DISPONIVEL_NOTIFICADO",
+                ":aguardando": "AGUARDANDO_ESTOQUE",
+                ":momento": momento,
+                ":obs": "Livro em estoque no ato do pedido. Cliente avisado para comparecer ao sebo.",
+            },
+        )
+        return True
+    except ClientError as erro:
+        if erro.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
 def solicitar_livro(dados: dict) -> dict:
     """
     Registra o pedido de compra de um livro.
-    Se houver estoque disponível, reserva o exemplar e envia confirmação via SNS.
+    Se houver estoque disponível, grava o pedido, reserva o exemplar e envia confirmação via SNS.
     Caso contrário, salva o pedido como AGUARDANDO_ESTOQUE na fila de espera.
     """
     titulo_informado = (dados.get("titulo") or "").strip()
@@ -210,23 +291,9 @@ def solicitar_livro(dados: dict) -> dict:
 
     livro_reservado = tentar_reservar_estoque_atomico(livro_id)
 
-    # Caso 1: Livro disponível em estoque -> reserva imediata e envio de e-mail
+    # Caso 1: Livro disponível em estoque -> persiste o pedido primeiro e depois envia o e-mail
     if livro_reservado is not None:
         titulo_oficial = livro_reservado.get("titulo", titulo_informado or livro_id)
-
-        assunto = f"[Sebo AWS] Livro disponivel para retirada: {titulo_oficial}"
-        corpo_email = (
-            f"Olá, {comprador_nome}!\n\n"
-            f"Boa notícia: o livro '{titulo_oficial}' está disponível em nosso estoque "
-            f"e um exemplar já foi separado para você (Pedido {pedido_id}).\n\n"
-            f"Por favor, compareça à livraria para concretizar a compra e retirar o seu livro.\n\n"
-            f"Dados do pedido:\n"
-            f"- Código: {pedido_id}\n"
-            f"- Livro: {titulo_oficial} ({livro_id})\n"
-            f"- Comprador: {comprador_nome} ({comprador_email})\n"
-            f"- Data/Hora: {momento_atual}\n"
-        )
-        email_enviado = enviar_notificacao_email(assunto, corpo_email)
 
         registro_pedido = {
             "pedido_id": pedido_id,
@@ -236,10 +303,32 @@ def solicitar_livro(dados: dict) -> dict:
             "comprador_email": comprador_email,
             "status": "DISPONIVEL_NOTIFICADO",
             "criado_em": momento_atual,
-            "notificado_em": momento_atual if email_enviado else None,
+            "notificado_em": momento_atual,
             "observacao": "Livro em estoque no ato do pedido. Cliente avisado para comparecer ao sebo.",
         }
-        tabela_pedidos.put_item(Item=registro_pedido)
+
+        try:
+            tabela_pedidos.put_item(Item=registro_pedido)
+        except Exception:
+            devolver_exemplar_ao_estoque(livro_id)
+            raise
+
+        assunto, corpo_email = montar_email_disponivel(
+            comprador_nome, comprador_email, titulo_oficial, livro_id, pedido_id, momento_atual
+        )
+        email_enviado = enviar_notificacao_email(assunto, corpo_email, comprador_email)
+
+        if not email_enviado:
+            registro_pedido["notificado_em"] = None
+            registro_pedido["observacao"] = "Exemplar separado, mas houve falha no envio do e-mail via SNS."
+            tabela_pedidos.update_item(
+                Key={"pedido_id": pedido_id},
+                UpdateExpression="SET notificado_em = :nulo, observacao = :obs",
+                ExpressionAttributeValues={
+                    ":nulo": None,
+                    ":obs": registro_pedido["observacao"],
+                },
+            )
 
         return montar_resposta(200, {
             "sucesso": True,
@@ -271,6 +360,34 @@ def solicitar_livro(dados: dict) -> dict:
     }
     tabela_pedidos.put_item(Item=registro_pedido)
 
+    # Nova checagem atômica: cobre o caso em que o estoque foi reposto exatamente
+    # entre a primeira tentativa e a gravação do pedido na fila
+    livro_reposto = tentar_reservar_estoque_atomico(livro_id)
+    if livro_reposto is not None:
+        if promover_pedido_para_disponivel(pedido_id, momento_atual):
+            assunto, corpo_email = montar_email_disponivel(
+                comprador_nome, comprador_email, titulo_oficial, livro_id, pedido_id, momento_atual
+            )
+            email_enviado = enviar_notificacao_email(assunto, corpo_email, comprador_email)
+            registro_pedido["status"] = "DISPONIVEL_NOTIFICADO"
+            registro_pedido["notificado_em"] = momento_atual if email_enviado else None
+            registro_pedido["observacao"] = "Livro em estoque no ato do pedido. Cliente avisado para comparecer ao sebo."
+            return montar_resposta(200, {
+                "sucesso": True,
+                "disponivel_imediato": True,
+                "email_enviado": email_enviado,
+                "mensagem": (
+                    f"O livro '{titulo_oficial}' está disponível! "
+                    f"Separamos seu exemplar e enviamos um e-mail para {comprador_email} "
+                    f"para você comparecer à livraria e concretizar a compra."
+                ),
+                "pedido": registro_pedido,
+                "estoque_restante": livro_reposto.get("quantidade", 0),
+            })
+        else:
+            # A Lambda 3 já havia atendido este pedido via Stream; devolve o exemplar extra
+            devolver_exemplar_ao_estoque(livro_id)
+
     return montar_resposta(200, {
         "sucesso": True,
         "disponivel_imediato": False,
@@ -287,8 +404,7 @@ def solicitar_livro(dados: dict) -> dict:
 def consultar_meus_pedidos(dados: dict) -> dict:
     """Retorna os pedidos registrados, permitindo filtrar pelo e-mail do comprador."""
     email_filtro = (dados.get("comprador_email") or "").strip().lower()
-    resultado = tabela_pedidos.scan()
-    pedidos = resultado.get("Items", [])
+    pedidos = escanear_tabela_completa(tabela_pedidos)
 
     if email_filtro:
         pedidos = [
