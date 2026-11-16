@@ -30,6 +30,8 @@ STATUS_LEGIVEL = {
     "DISPONIVEL_NOTIFICADO": "Separado (estoque imediato)",
     "CHEGOU_NOTIFICADO": "Chegou - cliente avisado",
     "AGUARDANDO_ESTOQUE": "Na fila de espera",
+    "RETIRADO": "Retirado - venda concretizada",
+    "CANCELADO": "Cancelado",
 }
 
 
@@ -159,14 +161,14 @@ def consultar_meus_pedidos(url: str, sessao: dict) -> None:
         print("\nNenhum pedido encontrado para este e-mail.")
         return
 
-    print(f"\n{'PEDIDO':<14} {'LIVRO':<30} {'STATUS':<30} {'CRIADO EM':<22} AVISADO EM")
-    print("-" * 120)
+    print(f"\n{'PEDIDO':<14} {'LIVRO':<30} {'STATUS':<30} {'CRIADO EM':<25} AVISADO EM")
+    print("-" * 123)
     for p in pedidos:
         print(
             f"{p.get('pedido_id', ''):<14} "
             f"{cortar(p.get('titulo'), 30):<30} "
             f"{STATUS_LEGIVEL.get(p.get('status'), p.get('status', '')):<30} "
-            f"{p.get('criado_em') or '-':<22} "
+            f"{p.get('criado_em') or '-':<25} "
             f"{p.get('notificado_em') or '-'}"
         )
     print(f"\nTotal: {dados.get('total', len(pedidos))} pedido(s).")

@@ -122,6 +122,7 @@
     .badge.ok   { background: var(--ok-bg);   color: var(--ok-fg); }
     .badge.warn { background: var(--warn-bg); color: var(--warn-fg); }
     .badge.info { background: var(--info-bg); color: var(--info-fg); }
+    .badge.muted { background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
 
     .msg { border-radius: 8px; padding: 10px 12px; margin-top: 12px; display: none; }
     .msg.show { display: block; }
@@ -232,6 +233,8 @@
         <div class="stat"><div class="valor" id="r-titulos">–</div><div class="rotulo">Títulos no acervo</div></div>
         <div class="stat"><div class="valor" id="r-exemplares">–</div><div class="rotulo">Exemplares disponíveis</div></div>
         <div class="stat"><div class="valor" id="r-vendas">–</div><div class="rotulo">Vendas / reservas</div></div>
+        <div class="stat"><div class="valor" id="r-aguardando-retirada">–</div><div class="rotulo">Aguardando retirada na loja</div></div>
+        <div class="stat"><div class="valor" id="r-retirados">–</div><div class="rotulo">Vendas concretizadas</div></div>
         <div class="stat"><div class="valor" id="r-fila">–</div><div class="rotulo">Clientes na fila de espera</div></div>
       </div>
       <div id="msg-painel" class="msg"></div>
@@ -270,7 +273,9 @@
 
     <div class="card">
       <h2>Pedidos (vendas e fila de espera)</h2>
-      <div id="tabela-pedidos" class="table-wrap"><p class="empty">Carregando…</p></div>
+      <p class="hint">Confirme a retirada quando o cliente buscar o livro na loja. Cancelar um pedido com exemplar separado devolve o exemplar ao estoque, e o próximo da fila é avisado automaticamente.</p>
+      <div id="msg-pedidos" class="msg"></div>
+      <div id="tabela-pedidos" class="table-wrap" style="margin-top:12px"><p class="empty">Carregando…</p></div>
     </div>
   </section>
 </div>
@@ -324,7 +329,10 @@
     DISPONIVEL_NOTIFICADO: ["Separado (estoque imediato)", "ok"],
     CHEGOU_NOTIFICADO: ["Chegou — cliente avisado", "info"],
     AGUARDANDO_ESTOQUE: ["Na fila de espera", "warn"],
+    RETIRADO: ["Retirado — venda concretizada", "ok"],
+    CANCELADO: ["Cancelado", "muted"],
   };
+  const STATUS_EXEMPLAR_SEPARADO = ["DISPONIVEL_NOTIFICADO", "CHEGOU_NOTIFICADO"];
   function badgeStatus(status) {
     const [texto, tipo] = STATUS_INFO[status] || [status || "–", "info"];
     return `<span class="badge ${tipo}">${escapar(texto)}</span>`;
@@ -497,17 +505,31 @@
     comBotao($("btn-meus"), carregarMeusPedidos);
   });
 
-  function tabelaPedidos(pedidos, mostrarComprador) {
+  // Botões de ação do colaborador conforme o status do pedido
+  function acoesPedido(p) {
+    const id = escapar(p.pedido_id);
+    const botoes = [];
+    if (STATUS_EXEMPLAR_SEPARADO.includes(p.status)) {
+      botoes.push(`<button class="small" data-acao="confirmar_retirada" data-pedido="${id}">Confirmar retirada</button>`);
+    }
+    if (STATUS_EXEMPLAR_SEPARADO.includes(p.status) || p.status === "AGUARDANDO_ESTOQUE") {
+      botoes.push(`<button class="small secondary" data-acao="cancelar_pedido" data-pedido="${id}">Cancelar</button>`);
+    }
+    return `<div class="row">${botoes.join("")}</div>`;
+  }
+
+  function tabelaPedidos(pedidos, visaoColaborador) {
     const linhas = pedidos.map((p) => `<tr>
       <td>${escapar(p.pedido_id)}</td>
       <td class="wrap">${escapar(p.titulo)}</td>
-      ${mostrarComprador ? `<td class="wrap">${escapar(p.comprador_nome)}<br><small style="color:var(--muted)">${escapar(p.comprador_email)}</small></td>` : ""}
+      ${visaoColaborador ? `<td class="wrap">${escapar(p.comprador_nome)}<br><small style="color:var(--muted)">${escapar(p.comprador_email)}</small></td>` : ""}
       <td>${badgeStatus(p.status)}</td>
       <td>${formatarData(p.criado_em)}</td>
       <td>${formatarData(p.notificado_em)}</td>
+      ${visaoColaborador ? `<td>${acoesPedido(p)}</td>` : ""}
     </tr>`).join("");
     return `<table>
-      <thead><tr><th>Pedido</th><th>Livro</th>${mostrarComprador ? "<th>Comprador</th>" : ""}<th>Status</th><th>Criado em</th><th>Avisado em</th></tr></thead>
+      <thead><tr><th>Pedido</th><th>Livro</th>${visaoColaborador ? "<th>Comprador</th>" : ""}<th>Status</th><th>Criado em</th><th>Avisado em</th>${visaoColaborador ? "<th>Ações</th>" : ""}</tr></thead>
       <tbody>${linhas}</tbody></table>`;
   }
 
@@ -522,6 +544,8 @@
       $("r-titulos").textContent = r.total_titulos ?? "–";
       $("r-exemplares").textContent = r.total_exemplares_disponiveis ?? "–";
       $("r-vendas").textContent = r.total_vendas_reservadas ?? "–";
+      $("r-aguardando-retirada").textContent = r.total_aguardando_retirada ?? "–";
+      $("r-retirados").textContent = r.total_retirados ?? "–";
       $("r-fila").textContent = r.total_fila_espera ?? "–";
 
       $("tabela-estoque").innerHTML = dados.livros.length
@@ -547,6 +571,30 @@
       $("tabela-pedidos").innerHTML = "";
     }
   }
+
+  // ------------------------------
+  // Colaborador: confirmar retirada / cancelar pedido
+  // ------------------------------
+  $("tabela-pedidos").addEventListener("click", (ev) => {
+    const botao = ev.target.closest("[data-acao]");
+    if (!botao) return;
+    const acao = botao.dataset.acao;
+    const pedidoId = botao.dataset.pedido;
+    if (acao === "cancelar_pedido" && !confirm(`Cancelar o pedido ${pedidoId}?`)) return;
+
+    esconderMsg("msg-pedidos");
+    comBotao(botao, async () => {
+      try {
+        const dados = await chamarLambda("colaborador", { acao, pedido_id: pedidoId });
+        mostrarMsg("msg-pedidos", dados.mensagem, "ok");
+        await carregarPainel();
+        // Um cancelamento devolve o exemplar ao estoque e aciona o notificador de forma assíncrona
+        if (dados.exemplar_devolvido) setTimeout(carregarPainel, 4000);
+      } catch (e) {
+        mostrarMsg("msg-pedidos", e.message, "err");
+      }
+    });
+  });
 
   $("btn-painel").addEventListener("click", (ev) => comBotao(ev.currentTarget, carregarPainel));
   $("btn-listar").addEventListener("click", (ev) => comBotao(ev.currentTarget, carregarAcervo));

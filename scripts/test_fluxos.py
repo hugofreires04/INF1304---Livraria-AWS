@@ -6,6 +6,8 @@ Valida os três cenários exigidos para o Sebo Serverless:
 - Fluxo 2: Interesse em livro sem estoque (quantidade == 0) -> inclusão na fila de espera com status AGUARDANDO_ESTOQUE;
 - Fluxo 3: Reposição de estoque pelo colaborador -> gatilho do DynamoDB Stream aciona a Lambda 3 ->
            reserva automática do exemplar, status atualizado para CHEGOU_NOTIFICADO e envio de e-mail SNS.
+- Fluxo 4: Colaborador confirma a retirada de um pedido (RETIRADO) e cancela outro (CANCELADO) ->
+           o exemplar devolvido aciona o Stream e o próximo cliente da fila é atendido automaticamente.
 
 Modos de execução:
 1. Modo Local (--local): Simula o DynamoDB, o DynamoDB Stream e o SNS em memória e invoca
@@ -22,6 +24,7 @@ import copy
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
 from decimal import Decimal
@@ -128,6 +131,10 @@ class TabelaDynamoDBMemoria:
             if "#status = :aguardando" in ConditionExpression:
                 if item_atual.get("status") != valores.get(":aguardando"):
                     raise erro_condicional_dynamodb()
+            if "#status IN (" in ConditionExpression:
+                permitidos = [valores[k] for k in re.findall(r":\w+", ConditionExpression.split("IN", 1)[1])]
+                if not existia or item_atual.get("status") not in permitidos:
+                    raise erro_condicional_dynamodb()
 
         # Aplica as UpdateExpressions utilizadas nas Lambdas 1, 2 e 3
         if "quantidade = quantidade - :um" in UpdateExpression:
@@ -154,6 +161,11 @@ class TabelaDynamoDBMemoria:
             item_atual["total_vendidos"] = int(item_atual.get("total_vendidos", valores[":zero"]))
             item_atual["atualizado_em"] = valores[":agora"]
 
+        elif "#status = :status_final" in UpdateExpression:
+            item_atual["status"] = valores[":status_final"]
+            item_atual[(ExpressionAttributeNames or {})["#momento"]] = valores[":momento"]
+            item_atual["observacao"] = valores[":obs"]
+
         elif "#status = :novo" in UpdateExpression:
             item_atual["status"] = valores[":novo"]
             item_atual["notificado_em"] = valores[":momento"]
@@ -166,6 +178,8 @@ class TabelaDynamoDBMemoria:
         imagem_antiga = copy.deepcopy(self.itens.get(valor_pk))
         self.itens[valor_pk] = item_atual
         self._disparar_stream("MODIFY" if existia else "INSERT", imagem_antiga, item_atual)
+        if ReturnValues == "ALL_OLD":
+            return {"Attributes": copy.deepcopy(imagem_antiga)} if imagem_antiga else {}
         return {"Attributes": copy.deepcopy(item_atual)}
 
     def _disparar_stream(self, tipo_evento: str, imagem_antiga: dict | None, imagem_nova: dict) -> None:
@@ -328,8 +342,46 @@ def executar_teste_local() -> None:
     print(f"  -> [PASSOU] Exemplar recém-chegado foi alocado para Maria (estoque livre voltou para 0).")
     print(f"  -> [PASSOU] E-mail SNS de chegada enviado: '{emails_publicados_sns[-1]['Subject']}'")
 
+    # --------------------------------------------------------------------------
+    # FLUXO 4: Retirada na loja e cancelamento -> exemplar devolvido atende o próximo da fila
+    # --------------------------------------------------------------------------
+    print("\n[FLUXO 4] Retirada na loja e cancelamento de pedido...")
+    pedido_hugo_id = corpo_f1["pedido"]["pedido_id"]
+    corpo_joana = json.loads(l1.lambda_handler(
+        {
+            "acao": "solicitar_livro",
+            "titulo": "Dom Casmurro",
+            "comprador_nome": "Joana Lima",
+            "comprador_email": "joana@exemplo.com",
+        },
+        None,
+    )["body"])
+    pedido_joana_id = corpo_joana["pedido"]["pedido_id"]
+    assert corpo_joana["pedido"]["status"] == "AGUARDANDO_ESTOQUE"
+
+    resp_retirada = l2.lambda_handler({"acao": "confirmar_retirada", "pedido_id": pedido_hugo_id}, None)
+    assert resp_retirada["statusCode"] == 200
+    assert tabela_pedidos_mem.itens[pedido_hugo_id]["status"] == "RETIRADO"
+    assert tabela_livros_mem.itens["dom-casmurro"]["quantidade"] == 0
+    print(f"  -> [PASSOU] Retirada do pedido {pedido_hugo_id} confirmada (status RETIRADO, estoque inalterado).")
+
+    emails_antes = len(emails_publicados_sns)
+    corpo_cancel = json.loads(l2.lambda_handler({"acao": "cancelar_pedido", "pedido_id": pedido_fila_id}, None)["body"])
+    assert corpo_cancel["sucesso"] is True and corpo_cancel["exemplar_devolvido"] is True
+    assert tabela_pedidos_mem.itens[pedido_fila_id]["status"] == "CANCELADO"
+    assert tabela_pedidos_mem.itens[pedido_joana_id]["status"] == "CHEGOU_NOTIFICADO"
+    assert tabela_livros_mem.itens["dom-casmurro"]["quantidade"] == 0
+    assert tabela_livros_mem.itens["dom-casmurro"]["total_vendidos"] == 2
+    assert len(emails_publicados_sns) == emails_antes + 1
+    print(f"  -> [PASSOU] Pedido {pedido_fila_id} cancelado; o exemplar voltou ao estoque.")
+    print(f"  -> [PASSOU] Stream atendeu automaticamente o próximo da fila ({pedido_joana_id} -> CHEGOU_NOTIFICADO).")
+
+    resp_invalida = l2.lambda_handler({"acao": "confirmar_retirada", "pedido_id": pedido_fila_id}, None)
+    assert resp_invalida["statusCode"] == 409
+    print("  -> [PASSOU] Não é possível confirmar a retirada de um pedido cancelado (HTTP 409).")
+
     print("\n" + "=" * 74)
-    print("  RESULTADO FINAL: TODOS OS 3 FLUXOS PASSARAM COM 100% DE SUCESSO!")
+    print("  RESULTADO FINAL: TODOS OS 4 FLUXOS PASSARAM COM 100% DE SUCESSO!")
     print("=" * 74)
 
 
@@ -409,11 +461,20 @@ def executar_teste_aws(url_comprador: str, url_colaborador: str) -> None:
     pedidos_cliente2 = r_pedidos.get("pedidos", [])
     pedido_atendido = next((p for p in pedidos_cliente2 if p.get("pedido_id") == pedido_espera_id), {})
     print(f"   Status atualizado do Pedido {pedido_espera_id}: {pedido_atendido.get('status')}")
+
+    pedido_compra1_id = r_compra1.get("pedido", {}).get("pedido_id")
+    print(f"\n5. [FLUXO 4] Colaborador confirma a retirada do pedido {pedido_compra1_id} na loja...")
+    r_retirada = requests.post(
+        url_colaborador,
+        json={"acao": "confirmar_retirada", "pedido_id": pedido_compra1_id},
+        timeout=20,
+    ).json()
+    print(f"   Resposta Lambda 2: {r_retirada.get('mensagem')}")
     print("\n" + "=" * 74)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Testa os 3 fluxos do Sebo Serverless.")
+    parser = argparse.ArgumentParser(description="Testa os fluxos de negócio do Sebo Serverless.")
     parser.add_argument(
         "--local",
         action="store_true",

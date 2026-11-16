@@ -4,7 +4,8 @@ Interface de terminal do Colaborador do sebo.
 Consome a Function URL da Lambda sebo-colaborador-service para:
 - Ver o painel de estoque, vendas e fila de espera;
 - Cadastrar novos livros ou repor exemplares (a fila de espera é atendida
-  automaticamente pelo notificador acionado via DynamoDB Stream).
+  automaticamente pelo notificador acionado via DynamoDB Stream);
+- Confirmar a retirada de um livro na loja ou cancelar um pedido.
 
 A URL é lida da variável LAMBDA_COLABORADOR_URL no arquivo .env (raiz do projeto)
 ou solicitada no terminal caso não esteja configurada.
@@ -30,7 +31,10 @@ STATUS_LEGIVEL = {
     "DISPONIVEL_NOTIFICADO": "Separado (estoque imediato)",
     "CHEGOU_NOTIFICADO": "Chegou - cliente avisado",
     "AGUARDANDO_ESTOQUE": "Na fila de espera",
+    "RETIRADO": "Retirado - venda concretizada",
+    "CANCELADO": "Cancelado",
 }
+STATUS_EXEMPLAR_SEPARADO = ("DISPONIVEL_NOTIFICADO", "CHEGOU_NOTIFICADO")
 
 
 def carregar_url_lambda() -> str:
@@ -94,6 +98,9 @@ def mostrar_painel(url: str) -> None:
     print(f"  Títulos no acervo ........... {resumo.get('total_titulos', 0)}")
     print(f"  Exemplares disponíveis ...... {resumo.get('total_exemplares_disponiveis', 0)}")
     print(f"  Vendas / reservas ........... {resumo.get('total_vendas_reservadas', 0)}")
+    print(f"  Aguardando retirada na loja . {resumo.get('total_aguardando_retirada', 0)}")
+    print(f"  Vendas concretizadas ........ {resumo.get('total_retirados', 0)}")
+    print(f"  Pedidos cancelados .......... {resumo.get('total_cancelados', 0)}")
     print(f"  Clientes na fila de espera .. {resumo.get('total_fila_espera', 0)}")
 
     livros = dados.get("livros", [])
@@ -115,25 +122,38 @@ def mostrar_painel(url: str) -> None:
         )
 
 
-def mostrar_pedidos(url: str, somente_fila: bool) -> None:
-    """Exibe os pedidos registrados (todos ou apenas os que estão na fila de espera)."""
+def mostrar_pedidos(url: str, filtro: str = "todos") -> list:
+    """
+    Exibe os pedidos registrados e retorna a lista exibida.
+    filtro: 'todos', 'fila' (aguardando estoque), 'separados' (exemplar aguardando retirada)
+    ou 'cancelaveis' (separados ou na fila de espera).
+    """
     dados = obter_painel(url)
     if dados is None:
-        return
+        return []
 
     pedidos = dados.get("pedidos", [])
-    if somente_fila:
+    if filtro == "fila":
         pedidos = sorted(
             (p for p in pedidos if p.get("status") == "AGUARDANDO_ESTOQUE"),
-            key=lambda p: p.get("criado_em", ""),
+            key=lambda p: (p.get("criado_em", ""), p.get("pedido_id", "")),
         )
+    elif filtro == "separados":
+        pedidos = [p for p in pedidos if p.get("status") in STATUS_EXEMPLAR_SEPARADO]
+    elif filtro == "cancelaveis":
+        pedidos = [p for p in pedidos if p.get("status") in STATUS_EXEMPLAR_SEPARADO + ("AGUARDANDO_ESTOQUE",)]
 
     if not pedidos:
-        print("\nNenhum pedido " + ("na fila de espera." if somente_fila else "registrado."))
-        return
+        descricao = {
+            "fila": "na fila de espera.",
+            "separados": "aguardando retirada.",
+            "cancelaveis": "que possa ser cancelado.",
+        }.get(filtro, "registrado.")
+        print("\nNenhum pedido " + descricao)
+        return []
 
-    print(f"\n{'PEDIDO':<14} {'LIVRO':<26} {'COMPRADOR':<28} {'STATUS':<28} {'CRIADO EM':<22} AVISADO EM")
-    print("-" * 140)
+    print(f"\n{'PEDIDO':<14} {'LIVRO':<26} {'COMPRADOR':<28} {'STATUS':<28} {'CRIADO EM':<25} AVISADO EM")
+    print("-" * 143)
     for p in pedidos:
         comprador = f"{p.get('comprador_nome', '')} <{p.get('comprador_email', '')}>"
         print(
@@ -141,10 +161,37 @@ def mostrar_pedidos(url: str, somente_fila: bool) -> None:
             f"{cortar(p.get('titulo'), 26):<26} "
             f"{cortar(comprador, 28):<28} "
             f"{STATUS_LEGIVEL.get(p.get('status'), p.get('status', '')):<28} "
-            f"{p.get('criado_em') or '-':<22} "
+            f"{p.get('criado_em') or '-':<25} "
             f"{p.get('notificado_em') or '-'}"
         )
     print(f"\nTotal: {len(pedidos)} pedido(s).")
+    return pedidos
+
+
+def alterar_pedido(url: str, acao: str) -> None:
+    """Confirma a retirada ('confirmar_retirada') ou cancela ('cancelar_pedido') um pedido escolhido pelo código."""
+    if acao == "confirmar_retirada":
+        print("\n--- Confirmar retirada na loja ---")
+        candidatos = mostrar_pedidos(url, filtro="separados")
+    else:
+        print("\n--- Cancelar pedido ---")
+        candidatos = mostrar_pedidos(url, filtro="cancelaveis")
+    if not candidatos:
+        return
+
+    pedido_id = input("\nCódigo do pedido (Enter para voltar): ").strip().upper()
+    if not pedido_id:
+        return
+    if acao == "cancelar_pedido" and input(f"Confirma o cancelamento de {pedido_id}? (s/N): ").strip().lower() != "s":
+        print("Cancelamento abortado.")
+        return
+
+    dados = chamar_lambda(url, {"acao": acao, "pedido_id": pedido_id})
+    if dados is None:
+        return
+    print(f"\n{dados.get('mensagem', '')}")
+    if dados.get("exemplar_devolvido"):
+        print("   Dica: use a opção 3 em alguns segundos para ver se o próximo da fila foi atendido.")
 
 
 def cadastrar_ou_repor(url: str) -> None:
@@ -186,8 +233,10 @@ def main() -> None:
     opcoes = {
         "1": ("Painel de estoque e resumo", lambda: mostrar_painel(url)),
         "2": ("Cadastrar ou repor livro", lambda: cadastrar_ou_repor(url)),
-        "3": ("Ver fila de espera", lambda: mostrar_pedidos(url, somente_fila=True)),
-        "4": ("Ver todos os pedidos (vendas e fila)", lambda: mostrar_pedidos(url, somente_fila=False)),
+        "3": ("Ver fila de espera", lambda: mostrar_pedidos(url, filtro="fila")),
+        "4": ("Ver todos os pedidos (vendas e fila)", lambda: mostrar_pedidos(url, filtro="todos")),
+        "5": ("Confirmar retirada de livro na loja", lambda: alterar_pedido(url, "confirmar_retirada")),
+        "6": ("Cancelar pedido", lambda: alterar_pedido(url, "cancelar_pedido")),
     }
 
     print("\n==============================")
