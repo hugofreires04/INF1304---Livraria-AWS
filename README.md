@@ -209,7 +209,7 @@ Para criar pelo Console, os recursos são:
 | Tabela `SeboPedidos` | PK `pedido_id` (String) |
 | Tópico `SeboNotificacoes` | Standard, com assinatura de e-mail confirmada |
 | 3 Lambdas | Python 3.12, role `LabRole`, timeout 20 s, código de `lambdas/<pasta>/lambda_function.py` |
-| Function URLs | Lambdas 1 e 2, auth `NONE`, CORS com origem `*` |
+| Function URLs | Lambdas 1 e 2, auth `NONE`, **sem** CORS na URL (as Lambdas já enviam os cabeçalhos; com os dois, o navegador recebe o cabeçalho duplicado e bloqueia) |
 | Gatilho da Lambda 3 | DynamoDB `SeboLivros`, posição **Latest**; opcional: 3 tentativas, *report batch item failures* e destino de falha na fila SQS `SeboNotificadorFalhas` |
 
 ## 7. Operação
@@ -228,15 +228,17 @@ Roteiro de demonstração:
 
 **Testado localmente, com a AWS simulada (`scripts/test_fluxos.py --local` e a biblioteca `moto`):** os três fluxos, a retirada e o cancelamento, a fila atendida em ordem de chegada com estoque parcial, as disputas pelo último exemplar e o `setup_aws.py`. Todos funcionaram.
 
-**Testes na AWS Academy:** *a preencher após a execução no Learner Lab.*
+**Testes na AWS Academy (Learner Lab):** feitos com `scripts/seed_acervo.py` e `scripts/test_fluxos.py` nas Function URLs reais.
 
 | Verificação | Resultado |
 | :--- | :--- |
-| `setup_aws.py` cria os recursos | |
-| Fluxo 1: e-mail imediato | |
-| Fluxo 2: pedido na fila | |
-| Fluxo 3: Stream aciona a Lambda 3 e o e-mail chega | |
-| Retirada e cancelamento | |
+| `setup_aws.py` cria os recursos | Funcionou: tabelas, tópico, 3 Lambdas, Function URLs, fila de falhas e gatilho do Stream criados com a `LabRole` |
+| Fluxo 1: e-mail imediato | Funcionou: pedido `DISPONIVEL_NOTIFICADO` e e-mail "Livro disponivel para retirada" recebido |
+| Fluxo 2: pedido na fila | Funcionou: pedido `AGUARDANDO_ESTOQUE` |
+| Fluxo 3: Stream aciona a Lambda 3 e o e-mail chega | Funcionou: cerca de 1 s após a reposição, a Lambda 3 atendeu o pedido (log no CloudWatch) e o e-mail "Seu livro chegou" foi recebido |
+| Retirada | Funcionou: pedido passou a `RETIRADO` |
+| Cancelamento com próximo da fila avisado | *a testar* |
+| Interface Web | Funcionou. A primeira versão do `setup_aws.py` ligava CORS na Function URL, o que duplicava o cabeçalho `Access-Control-Allow-Origin` e fazia o navegador bloquear as respostas; o script foi corrigido para deixar o CORS só com as Lambdas |
 
 **Limitações:**
 - **E-mails para todos os inscritos.** Pela simplificação do enunciado, o cliente já está inscrito no tópico, e o SNS manda cada mensagem a todos os inscritos. Para cada cliente receber só os próprios avisos, a assinatura precisa de um filtro pelo atributo `comprador_email` (`setup_aws.py --filtrar-por-email`).

@@ -223,24 +223,24 @@ def criar_ou_atualizar_lambda(lambda_client, cfg: dict, role_arn: str, topic_arn
 
 
 def garantir_function_url(lambda_client, nome_funcao: str) -> str:
-    """Configura a Function URL pública (AuthType=NONE) e aplica a permissão de invocação pública."""
-    cors_config = {
-        "AllowCredentials": False,
-        "AllowHeaders": ["*"],
-        "AllowMethods": ["*"],
-        "AllowOrigins": ["*"],
-    }
-
+    """
+    Configura a Function URL pública (AuthType=NONE) e aplica a permissão de invocação pública.
+    A URL fica sem configuração de CORS: as próprias Lambdas já respondem o OPTIONS e enviam os
+    cabeçalhos Access-Control-*. Com CORS também na URL, a AWS duplica o Access-Control-Allow-Origin
+    e o navegador bloqueia a resposta.
+    """
     try:
         config_url = lambda_client.get_function_url_config(FunctionName=nome_funcao)
         function_url = config_url["FunctionUrl"]
+        if config_url.get("Cors"):
+            lambda_client.update_function_url_config(FunctionName=nome_funcao, AuthType="NONE", Cors={})
+            print(f"  [OK] CORS removido da Function URL de '{nome_funcao}' (tratado pela própria Lambda).")
     except ClientError as erro:
         if erro.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
         config_url = lambda_client.create_function_url_config(
             FunctionName=nome_funcao,
             AuthType="NONE",
-            Cors=cors_config,
         )
         function_url = config_url["FunctionUrl"]
 
